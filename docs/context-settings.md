@@ -484,7 +484,10 @@ The `signer` field in `Settings` supports two types: `local` and `remote`.
       "alg": "ps256", // Signing algorithm 
       "sign_cert": "cert.pem", // PEM string
       "private_key": "key.pem", // PEM string
-      "tsa_url": "http://timestamp.digicert.com" // Optional timestamp authority URL
+      "tsa_url": "http://timestamp.digicert.com", // Optional timestamp authority URL
+      "tsa_headers": [ // Optional headers for TSA requests, see "Authenticating to a timestamp authority"
+        { "name": "Authorization", "from_env": "C2PA_TSA_AUTH_TOKEN", "format": "Bearer {value}" }
+      ]
     }
   },
 ...
@@ -498,10 +501,75 @@ The `signer` field in `Settings` supports two types: `local` and `remote`.
       "alg": "ps256", // Signing algorithm       
       "url": "https://my-signing-service.com/sign", // Signing service URL
       "sign_cert": "cert.pem", // Path to cert file for verification
-      "tsa_url": "http://timestamp.digicert.com" // Optional timestamp authority URL
+      "tsa_url": "http://timestamp.digicert.com", // Optional timestamp authority URL
+      "tsa_headers": [ // Optional headers for TSA requests, see "Authenticating to a timestamp authority"
+        { "name": "Authorization", "from_env": "C2PA_TSA_AUTH_TOKEN", "format": "Bearer {value}" }
+      ]
     }
   }
 ```
+
+### Authenticating to a timestamp authority
+
+Some timestamp authorities require an API key or bearer token. Add `tsa_headers` next to `tsa_url` to send extra HTTP headers with every RFC 3161 request. Each entry names one header and takes its value from exactly one of `value` or `from_env`:
+
+| Field | Meaning |
+|---|---|
+| `name` | HTTP header name, for example `Authorization`. |
+| `value` | The header value, written inline. Use for non-secret headers only. |
+| `from_env` | Name of an environment variable to read when the signer is created. Use for secrets. |
+| `format` | Optional template applied to the resolved value. Must contain `{value}`, for example `"Bearer {value}"`. |
+
+TOML:
+
+```toml
+[signer.local]
+alg = "es256"
+sign_cert = "..."
+private_key = "..."
+tsa_url = "https://tsa.example.com"
+
+[[signer.local.tsa_headers]]
+name = "X-Tenant"
+value = "acme-prod"
+
+[[signer.local.tsa_headers]]
+name = "Authorization"
+from_env = "C2PA_TSA_AUTH_TOKEN"
+format = "Bearer {value}"
+```
+
+JSON:
+
+```json
+{
+  "signer": {
+    "local": {
+      "alg": "es256",
+      "sign_cert": "...",
+      "private_key": "...",
+      "tsa_url": "https://tsa.example.com",
+      "tsa_headers": [
+        { "name": "X-Tenant", "value": "acme-prod" },
+        { "name": "Authorization", "from_env": "C2PA_TSA_AUTH_TOKEN", "format": "Bearer {value}" }
+      ]
+    }
+  }
+}
+```
+
+With `C2PA_TSA_AUTH_TOKEN=abc123` in the environment, the TSA receives `Authorization: Bearer abc123`.
+
+> [!WARNING]
+> Do not put tokens or API keys in `value`. Settings files are often committed to source control or shared between environments. Use `from_env` so the secret only ever lives in the environment of the signing process.
+
+Details:
+
+- Header definitions are validated when the settings load. Environment variables are read when the signer is created (for example, on the first `save_to_stream()`), so a process that only verifies can load a shared settings file without having the secret.
+- `Content-Type` cannot be overridden; the SDK always sends `application/timestamp-query`.
+- The same headers are used for the claim's own time stamp and for `TimeStamp` assertions generated via `builder.auto_timestamp_assertion`.
+- `tsa_headers` on `cawg_x509_signer` is accepted but ignored, like `tsa_url`: the identity signature is not time stamped.
+- Signers built in code provide the same headers through [`Signer::timestamp_request_headers`](https://docs.rs/c2pa/latest/c2pa/trait.Signer.html#method.timestamp_request_headers) or [`CallbackSigner::set_tsa_headers`](https://docs.rs/c2pa/latest/c2pa/struct.CallbackSigner.html#method.set_tsa_headers).
 
 ## Advanced topics
 

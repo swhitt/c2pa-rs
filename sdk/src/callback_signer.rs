@@ -48,6 +48,10 @@ pub struct CallbackSigner {
 
     /// The optional URL of a Time Stamping Authority.
     pub tsa_url: Option<String>,
+
+    /// Additional HTTP headers to send with each Time Stamping Authority request,
+    /// for example an `Authorization` header. See [`set_tsa_headers`](Self::set_tsa_headers).
+    pub tsa_headers: Option<Vec<(String, String)>>,
 }
 
 unsafe impl Send for CallbackSigner {}
@@ -76,6 +80,27 @@ impl CallbackSigner {
     /// Set a time stamping authority URL to call when signing.
     pub fn set_tsa_url<S: Into<String>>(mut self, url: S) -> Self {
         self.tsa_url = Some(url.into());
+        self
+    }
+
+    /// Set additional HTTP headers to send with each time stamping authority request.
+    ///
+    /// Use this when the TSA configured via [`set_tsa_url`](Self::set_tsa_url)
+    /// requires authentication, for example an `Authorization: Bearer ...` header.
+    /// Do not include `Content-Type`; the SDK sets it on every request.
+    ///
+    /// An empty iterator clears the headers.
+    pub fn set_tsa_headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let headers: Vec<(String, String)> = headers
+            .into_iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+        self.tsa_headers = (!headers.is_empty()).then_some(headers);
         self
     }
 
@@ -133,6 +158,7 @@ impl Default for CallbackSigner {
             certs: Vec::new(),
             reserve_size: 10000,
             tsa_url: None,
+            tsa_headers: None,
         }
     }
 }
@@ -158,6 +184,10 @@ impl Signer for CallbackSigner {
     fn time_authority_url(&self) -> Option<String> {
         self.tsa_url.clone()
     }
+
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.tsa_headers.clone()
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -182,6 +212,10 @@ impl AsyncSigner for CallbackSigner {
 
     fn time_authority_url(&self) -> Option<String> {
         self.tsa_url.clone()
+    }
+
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.tsa_headers.clone()
     }
 }
 
@@ -210,6 +244,7 @@ mod tests {
         let signer = make_ed25519_signer();
         assert_eq!(signer.alg, SigningAlg::Ed25519);
         assert_eq!(signer.tsa_url, None);
+        assert_eq!(signer.tsa_headers, None);
         assert!(signer.context.is_null());
         assert!(!signer.certs.is_empty());
         assert!(signer.reserve_size >= 10000);
@@ -226,6 +261,29 @@ mod tests {
             Signer::time_authority_url(&signer),
             Some("http://timestamp.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn set_tsa_headers_stores_headers_for_sync_and_async() {
+        let signer = make_ed25519_signer()
+            .set_tsa_url("http://timestamp.example.com")
+            .set_tsa_headers([("Authorization", "Bearer abc123"), ("X-Tenant", "acme")]);
+        let expected = Some(vec![
+            ("Authorization".to_owned(), "Bearer abc123".to_owned()),
+            ("X-Tenant".to_owned(), "acme".to_owned()),
+        ]);
+        assert_eq!(signer.tsa_headers, expected);
+        assert_eq!(Signer::timestamp_request_headers(&signer), expected);
+        assert_eq!(AsyncSigner::timestamp_request_headers(&signer), expected);
+    }
+
+    #[test]
+    fn set_tsa_headers_with_empty_iterator_clears_headers() {
+        let signer = make_ed25519_signer()
+            .set_tsa_headers([("Authorization", "Bearer abc123")])
+            .set_tsa_headers(Vec::<(String, String)>::new());
+        assert_eq!(signer.tsa_headers, None);
+        assert_eq!(Signer::timestamp_request_headers(&signer), None);
     }
 
     #[test]

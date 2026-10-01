@@ -18,7 +18,6 @@ use http::Request;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    create_signer,
     crypto::cert_chain_pem_to_der,
     dynamic_assertion::DynamicAssertion,
     http::{SyncGenericResolver, SyncHttpResolver},
@@ -28,9 +27,218 @@ use crate::{
         SignerPayload,
     },
     settings::{Settings, SettingsValidate},
-    signer::OwnedSignerWrapper,
+    signer::{OwnedSignerWrapper, RawSignerWrapper},
     BoxedSigner, Error, Result, Signer,
 };
+
+/// One HTTP header to send with every RFC 3161 time stamp request made by a
+/// signer configured from settings (see [`SignerSettings`]).
+///
+/// Use this to authenticate to a time stamp authority (TSA) that requires an
+/// API key or bearer token. Exactly one of `value` or `from_env` must be set:
+///
+/// * `value` holds the header value inline. Use it for non-secret headers.
+/// * `from_env` names an environment variable that is read when the signer is
+///   created. Use it for secrets so they never appear in the settings file.
+///
+/// `format` optionally wraps the resolved value and must contain the
+/// placeholder `{value}`. This lets the environment variable hold just the
+/// token while the settings file supplies the scheme, e.g. `"Bearer {value}"`.
+///
+/// `Content-Type` cannot be set here: the SDK always sends
+/// `application/timestamp-query`, as required by [RFC 3161].
+///
+/// # Example
+///
+/// ```toml
+/// [signer.local]
+/// alg = "es256"
+/// sign_cert = "..."
+/// private_key = "..."
+/// tsa_url = "https://tsa.example.com"
+///
+/// [[signer.local.tsa_headers]]
+/// name = "X-Tenant"
+/// value = "acme-prod"
+///
+/// [[signer.local.tsa_headers]]
+/// name = "Authorization"
+/// from_env = "C2PA_TSA_AUTH_TOKEN"
+/// format = "Bearer {value}"
+/// ```
+///
+/// With `C2PA_TSA_AUTH_TOKEN=abc123` in the environment, the TSA receives
+/// `Authorization: Bearer abc123`.
+///
+/// [RFC 3161]: https://datatracker.ietf.org/doc/html/rfc3161
+#[cfg_attr(feature = "json_schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct TsaHeader {
+    /// HTTP header name, for example `Authorization`.
+    pub name: String,
+    /// Inline header value. Mutually exclusive with `from_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Name of an environment variable holding the header value, read when the
+    /// signer is created. Mutually exclusive with `value`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_env: Option<String>,
+    /// Optional template applied to the resolved value. Must contain `{value}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+impl TsaHeader {
+    /// Placeholder in [`format`](Self::format) that is replaced by the resolved value.
+    pub const VALUE_PLACEHOLDER: &'static str = "{value}";
+
+    /// Creates a header with an inline (non-secret) value.
+    pub fn with_value(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: Some(value.into()),
+            from_env: None,
+            format: None,
+        }
+    }
+
+    /// Creates a header whose value is read from the environment variable `var`
+    /// when the signer is created.
+    pub fn from_env(name: impl Into<String>, var: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: None,
+            from_env: Some(var.into()),
+            format: None,
+        }
+    }
+
+    /// Wraps the resolved value in `format`, which must contain
+    /// [`VALUE_PLACEHOLDER`](Self::VALUE_PLACEHOLDER).
+    pub fn with_format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    /// Checks that this header definition is well formed, without reading the
+    /// environment.
+    ///
+    /// Settings loading calls this automatically. It fails if `name` is not a
+    /// valid HTTP header name or is `Content-Type`, if neither or both of
+    /// `value` and `from_env` are set, if `format` lacks the `{value}`
+    /// placeholder, or if an inline `value` is not a valid HTTP header value.
+    pub fn validate(&self) -> Result<()> {
+        http::header::HeaderName::from_bytes(self.name.as_bytes()).map_err(|_| {
+            Error::BadParam(format!(
+                "tsa_headers: `{}` is not a valid HTTP header name",
+                self.name
+            ))
+        })?;
+        if self
+            .name
+            .eq_ignore_ascii_case(http::header::CONTENT_TYPE.as_str())
+        {
+            return Err(Error::BadParam(
+                "tsa_headers: `Content-Type` is set by the SDK and cannot be overridden".to_owned(),
+            ));
+        }
+        match (&self.value, &self.from_env) {
+            (Some(_), Some(_)) => {
+                return Err(Error::BadParam(format!(
+                    "tsa_headers: header `{}` sets both `value` and `from_env`; use exactly one",
+                    self.name
+                )))
+            }
+            (None, None) => return Err(self.missing_source_error()),
+            _ => {}
+        }
+        if let Some(format) = &self.format {
+            if !format.contains(Self::VALUE_PLACEHOLDER) {
+                return Err(Error::BadParam(format!(
+                    "tsa_headers: `format` for header `{}` must contain the `{}` placeholder",
+                    self.name,
+                    Self::VALUE_PLACEHOLDER
+                )));
+            }
+        }
+        // Inline values can be checked now; `from_env` values only once resolved.
+        if let Some(value) = &self.value {
+            Self::check_header_value(&self.name, &self.apply_format(value))?;
+        }
+        Ok(())
+    }
+
+    /// Resolves this header to a `(name, value)` pair, reading the environment
+    /// if `from_env` is set.
+    ///
+    /// Fails if the definition is invalid (see [`validate`](Self::validate)), if
+    /// the environment variable is unset or not valid Unicode, or if the final
+    /// value is not a valid HTTP header value (for example, it contains a line
+    /// break). Error messages never include the header value.
+    pub fn resolve(&self) -> Result<(String, String)> {
+        self.validate()?;
+        let raw = if let Some(value) = &self.value {
+            value.clone()
+        } else if let Some(var) = &self.from_env {
+            std::env::var(var).map_err(|err| {
+                let reason = match err {
+                    std::env::VarError::NotPresent => "is not set",
+                    std::env::VarError::NotUnicode(_) => "is not valid Unicode",
+                };
+                Error::BadParam(format!(
+                    "tsa_headers: environment variable `{var}` for header `{}` {reason}",
+                    self.name
+                ))
+            })?
+        } else {
+            return Err(self.missing_source_error());
+        };
+        let value = self.apply_format(&raw);
+        Self::check_header_value(&self.name, &value)?;
+        Ok((self.name.clone(), value))
+    }
+
+    fn apply_format(&self, raw: &str) -> String {
+        match &self.format {
+            Some(format) => format.replace(Self::VALUE_PLACEHOLDER, raw),
+            None => raw.to_owned(),
+        }
+    }
+
+    /// Rejects values that `http` would refuse (control characters such as CR/LF),
+    /// so a misconfigured secret can't inject extra header lines. The value itself
+    /// is deliberately kept out of the error.
+    fn check_header_value(name: &str, value: &str) -> Result<()> {
+        http::header::HeaderValue::from_str(value).map_err(|_| {
+            Error::BadParam(format!(
+                "tsa_headers: the value for header `{name}` is not a valid HTTP header value"
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn missing_source_error(&self) -> Error {
+        Error::BadParam(format!(
+            "tsa_headers: header `{}` must set either `value` or `from_env`",
+            self.name
+        ))
+    }
+}
+
+/// Resolves `tsa_headers` into the `(name, value)` pairs returned by
+/// [`Signer::timestamp_request_headers`]. An absent or empty list resolves to
+/// `None`, so signers without headers behave exactly as before.
+fn resolve_tsa_headers(headers: Option<&[TsaHeader]>) -> Result<Option<Vec<(String, String)>>> {
+    match headers {
+        None | Some([]) => Ok(None),
+        Some(headers) => headers
+            .iter()
+            .map(TsaHeader::resolve)
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+    }
+}
 
 /// Settings for configuring a local or remote [`Signer`].
 ///
@@ -53,6 +261,9 @@ pub enum SignerSettings {
         private_key: String,
         /// Time stamp authority URL for signing.
         tsa_url: Option<String>,
+        /// Additional HTTP headers to send with each time stamp authority request,
+        /// for example to authenticate (optional). See [`TsaHeader`].
+        tsa_headers: Option<Vec<TsaHeader>>,
         /// Referenced assertions for CAWG identity signing (optional).
         referenced_assertions: Option<Vec<String>>,
         /// Roles for CAWG identity signing (optional).
@@ -70,6 +281,9 @@ pub enum SignerSettings {
         sign_cert: String,
         /// Time stamp authority URL for signing.
         tsa_url: Option<String>,
+        /// Additional HTTP headers to send with each time stamp authority request,
+        /// for example to authenticate (optional). See [`TsaHeader`].
+        tsa_headers: Option<Vec<TsaHeader>>,
         /// Referenced assertions for CAWG identity signing (optional).
         referenced_assertions: Option<Vec<String>>,
         /// Roles for CAWG identity signing (optional).
@@ -122,19 +336,29 @@ impl SignerSettings {
                 sign_cert,
                 private_key,
                 tsa_url,
+                tsa_headers,
                 referenced_assertions: _,
                 roles: _,
             } => {
-                create_signer::from_keys(sign_cert.as_bytes(), private_key.as_bytes(), alg, tsa_url)
+                let tsa_headers = resolve_tsa_headers(tsa_headers.as_deref())?;
+                let signer = RawSignerWrapper::new(
+                    signer_from_private_key(private_key.as_bytes(), alg)?,
+                    cert_chain_pem_to_der(sign_cert.as_bytes())?,
+                    tsa_url,
+                )
+                .with_time_stamp_request_headers(tsa_headers);
+                Ok(Box::new(signer))
             }
             SignerSettings::Remote {
                 url,
                 alg,
                 sign_cert,
                 tsa_url,
+                tsa_headers,
                 referenced_assertions: _,
                 roles: _,
             } => {
+                let tsa_headers = resolve_tsa_headers(tsa_headers.as_deref())?;
                 let certs = cert_chain_pem_to_der(sign_cert.as_bytes())?;
                 let reserve_size = 10000 + certs.iter().map(|c| c.len()).sum::<usize>();
                 Ok(Box::new(RemoteSigner {
@@ -143,6 +367,7 @@ impl SignerSettings {
                     reserve_size,
                     certs,
                     tsa_url,
+                    tsa_headers,
                 }))
             }
         }
@@ -156,6 +381,8 @@ impl SignerSettings {
                 sign_cert: cawg_sign_cert,
                 private_key: cawg_private_key,
                 tsa_url: cawg_tsa_url,
+                // Like the TSA URL, unused: the identity signature is not time stamped.
+                tsa_headers: _,
                 referenced_assertions: cawg_referenced_assertions,
                 roles: cawg_roles,
             } => {
@@ -176,6 +403,8 @@ impl SignerSettings {
                 alg: cawg_alg,
                 sign_cert: cawg_sign_cert,
                 tsa_url: cawg_tsa_url,
+                // Like the TSA URL, unused: the identity signature is not time stamped.
+                tsa_headers: _,
                 referenced_assertions: cawg_referenced_assertions,
                 roles: cawg_roles,
             } => {
@@ -199,6 +428,11 @@ impl SignerSettings {
 
 impl SettingsValidate for SignerSettings {
     fn validate(&self) -> Result<()> {
+        let (SignerSettings::Local { tsa_headers, .. }
+        | SignerSettings::Remote { tsa_headers, .. }) = self;
+        for header in tsa_headers.iter().flatten() {
+            header.validate()?;
+        }
         Ok(())
     }
 }
@@ -495,13 +729,13 @@ impl Signer for CawgIdentitySigner {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct RemoteSigner {
     url: String,
     alg: SigningAlg,
     certs: Vec<Vec<u8>>,
     reserve_size: usize,
     tsa_url: Option<String>,
+    tsa_headers: Option<Vec<(String, String)>>,
 }
 
 impl Signer for RemoteSigner {
@@ -535,6 +769,10 @@ impl Signer for RemoteSigner {
 
     fn time_authority_url(&self) -> Option<String> {
         self.tsa_url.clone()
+    }
+
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.tsa_headers.clone()
     }
 }
 
@@ -654,6 +892,7 @@ pub mod tests {
         let signer = signer_settings.c2pa_signer().unwrap();
         assert_eq!(signer.alg(), alg);
         assert_eq!(signer.time_authority_url(), None);
+        assert_eq!(signer.timestamp_request_headers(), None);
         assert!(signer.sign(&[1, 2, 3]).is_ok());
     }
 
@@ -770,6 +1009,7 @@ pub mod tests {
         let signer = signer_settings.c2pa_signer().unwrap();
         assert_eq!(signer.alg(), alg);
         assert_eq!(signer.time_authority_url(), None);
+        assert_eq!(signer.timestamp_request_headers(), None);
         assert_eq!(signer.sign(&[1, 2, 3]).unwrap(), signed_bytes);
 
         mock.assert();
@@ -1049,5 +1289,419 @@ pub mod tests {
             .unwrap();
 
         assert_eq!(sig_info.cert_info.alg.unwrap(), cawg_alg);
+    }
+
+    // ---- tsa_headers --------------------------------------------------------
+
+    /// Settings for a local signer pointing at `tsa_url` with the given
+    /// `tsa_headers` JSON array.
+    fn local_signer_settings_with_tsa_headers(
+        tsa_url: &str,
+        tsa_headers: serde_json::Value,
+    ) -> crate::Result<Settings> {
+        let alg = SigningAlg::Es256;
+        let (sign_cert, private_key) = test_signer::cert_chain_and_private_key_for_alg(alg);
+        Settings::new().with_json(
+            &serde_json::json!({
+                "signer": {
+                    "local": {
+                        "alg": alg.to_string(),
+                        "sign_cert": String::from_utf8_lossy(sign_cert),
+                        "private_key": String::from_utf8_lossy(private_key),
+                        "tsa_url": tsa_url,
+                        "tsa_headers": tsa_headers,
+                    }
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn c2pa_signer_from(settings: Settings) -> crate::Result<crate::BoxedSigner> {
+        settings
+            .signer
+            .expect("signer settings should be present")
+            .c2pa_signer()
+    }
+
+    /// Error message from building the signer from `settings`, which must fail.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn c2pa_signer_error(settings: Settings) -> String {
+        c2pa_signer_from(settings)
+            .err()
+            .map(|err| err.to_string())
+            .expect("building the signer should fail")
+    }
+
+    /// Error message from loading local signer settings with the given `tsa_headers`.
+    fn tsa_headers_load_error(tsa_headers: serde_json::Value) -> String {
+        local_signer_settings_with_tsa_headers("https://tsa.example.com", tsa_headers)
+            .expect_err("settings with malformed tsa_headers should not load")
+            .to_string()
+    }
+
+    /// Sets an environment variable for the duration of a test and removes it on
+    /// drop, so a failing assertion can't leak state into other tests. Each test
+    /// uses a distinct variable name because tests run in parallel.
+    #[cfg(not(target_arch = "wasm32"))]
+    struct EnvVarGuard(&'static str);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            std::env::set_var(name, value);
+            Self(name)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    #[test]
+    fn tsa_headers_empty_list_yields_none() {
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([]),
+        )
+        .unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+        assert_eq!(signer.timestamp_request_headers(), None);
+    }
+
+    #[test]
+    fn tsa_headers_inline_values_keep_order_and_apply_format() {
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([
+                { "name": "X-Tenant", "value": "acme-prod" },
+                { "name": "X-Api-Key", "value": "k-123", "format": "Key {value}" },
+            ]),
+        )
+        .unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+        assert_eq!(
+            signer.timestamp_request_headers(),
+            Some(vec![
+                ("X-Tenant".to_owned(), "acme-prod".to_owned()),
+                ("X-Api-Key".to_owned(), "Key k-123".to_owned()),
+            ])
+        );
+    }
+
+    /// The documented TOML array-of-tables form (`[[signer.local.tsa_headers]]`).
+    #[test]
+    fn tsa_headers_toml_array_of_tables() {
+        let alg = SigningAlg::Es256;
+        let (sign_cert, private_key) = test_signer::cert_chain_and_private_key_for_alg(alg);
+        let toml = format!(
+            r#"
+[signer.local]
+alg = "{alg}"
+sign_cert = '''
+{sign_cert}'''
+private_key = '''
+{private_key}'''
+tsa_url = "https://tsa.example.com"
+
+[[signer.local.tsa_headers]]
+name = "X-Tenant"
+value = "acme-prod"
+
+[[signer.local.tsa_headers]]
+name = "Authorization"
+value = "Bearer inline-for-test"
+"#,
+            sign_cert = String::from_utf8_lossy(sign_cert),
+            private_key = String::from_utf8_lossy(private_key),
+        );
+        let settings = Settings::new().with_toml(&toml).unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+        assert_eq!(
+            signer.timestamp_request_headers(),
+            Some(vec![
+                ("X-Tenant".to_owned(), "acme-prod".to_owned()),
+                (
+                    "Authorization".to_owned(),
+                    "Bearer inline-for-test".to_owned()
+                ),
+            ])
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_headers_from_env_applies_format() {
+        const VAR: &str = "C2PA_TEST_TSA_HEADERS_FORMAT";
+        let _guard = EnvVarGuard::set(VAR, "abc123");
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([
+                { "name": "Authorization", "from_env": VAR, "format": "Bearer {value}" },
+            ]),
+        )
+        .unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+        assert_eq!(
+            signer.timestamp_request_headers(),
+            Some(vec![(
+                "Authorization".to_owned(),
+                "Bearer abc123".to_owned()
+            )])
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_headers_from_env_without_format_uses_raw_value() {
+        const VAR: &str = "C2PA_TEST_TSA_HEADERS_RAW";
+        let _guard = EnvVarGuard::set(VAR, "raw-token");
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([{ "name": "X-Api-Key", "from_env": VAR }]),
+        )
+        .unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+        assert_eq!(
+            signer.timestamp_request_headers(),
+            Some(vec![("X-Api-Key".to_owned(), "raw-token".to_owned())])
+        );
+    }
+
+    /// Loading settings must not read the environment: a verify-only process may
+    /// load a shared settings file without ever having the signing secret. The
+    /// missing variable is reported when the signer is actually created.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_headers_unset_env_var_fails_at_signer_creation_not_at_load() {
+        const VAR: &str = "C2PA_TEST_TSA_HEADERS_UNSET";
+        std::env::remove_var(VAR);
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([
+                { "name": "Authorization", "from_env": VAR, "format": "Bearer {value}" },
+            ]),
+        )
+        .expect("settings should load without reading the environment");
+
+        let msg = c2pa_signer_error(settings);
+        assert!(msg.contains(VAR), "{msg}");
+        assert!(msg.contains("Authorization"), "{msg}");
+    }
+
+    /// A secret containing CR/LF would otherwise let it inject extra header
+    /// lines; it is rejected, and the error must not echo the secret.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_headers_env_value_with_line_break_is_rejected_without_leaking_it() {
+        const VAR: &str = "C2PA_TEST_TSA_HEADERS_CRLF";
+        let _guard = EnvVarGuard::set(VAR, "abc\r\nX-Injected: 1");
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([{ "name": "Authorization", "from_env": VAR }]),
+        )
+        .unwrap();
+
+        let msg = c2pa_signer_error(settings);
+        assert!(msg.contains("Authorization"), "{msg}");
+        assert!(
+            !msg.contains("X-Injected"),
+            "error must not echo the secret: {msg}"
+        );
+    }
+
+    #[test]
+    fn tsa_headers_reject_both_value_and_from_env() {
+        let msg = tsa_headers_load_error(serde_json::json!([
+            { "name": "Authorization", "value": "x", "from_env": "Y" },
+        ]));
+        assert!(msg.contains("exactly one"), "{msg}");
+    }
+
+    #[test]
+    fn tsa_headers_reject_neither_value_nor_from_env() {
+        let msg = tsa_headers_load_error(serde_json::json!([{ "name": "Authorization" }]));
+        assert!(msg.contains("`value` or `from_env`"), "{msg}");
+    }
+
+    #[test]
+    fn tsa_headers_reject_invalid_header_name() {
+        let msg = tsa_headers_load_error(serde_json::json!([
+            { "name": "X Tenant", "value": "acme" },
+        ]));
+        assert!(msg.contains("not a valid HTTP header name"), "{msg}");
+    }
+
+    /// `Content-Type` is owned by the SDK (RFC 3161 fixes it), in any letter case.
+    #[test]
+    fn tsa_headers_reject_content_type() {
+        let msg = tsa_headers_load_error(serde_json::json!([
+            { "name": "content-type", "value": "text/plain" },
+        ]));
+        assert!(msg.contains("Content-Type"), "{msg}");
+    }
+
+    /// A `format` without the placeholder would silently send a constant.
+    #[test]
+    fn tsa_headers_reject_format_without_placeholder() {
+        let msg = tsa_headers_load_error(serde_json::json!([
+            { "name": "Authorization", "value": "x", "format": "Bearer" },
+        ]));
+        assert!(msg.contains("{value}"), "{msg}");
+    }
+
+    #[test]
+    fn tsa_headers_reject_inline_value_with_line_break() {
+        let msg = tsa_headers_load_error(serde_json::json!([
+            { "name": "X-Tenant", "value": "a\nb" },
+        ]));
+        assert!(msg.contains("not a valid HTTP header value"), "{msg}");
+    }
+
+    #[test]
+    fn tsa_headers_remote_signer() {
+        let alg = SigningAlg::Es256;
+        let (sign_cert, _) = test_signer::cert_chain_and_private_key_for_alg(alg);
+        let settings = Settings::new()
+            .with_json(
+                &serde_json::json!({
+                    "signer": {
+                        "remote": {
+                            "url": "https://signing.example.com/sign",
+                            "alg": alg.to_string(),
+                            "sign_cert": String::from_utf8_lossy(sign_cert),
+                            "tsa_url": "https://tsa.example.com",
+                            "tsa_headers": [{ "name": "X-Api-Key", "value": "k-123" }],
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+        assert_eq!(
+            signer.time_authority_url().as_deref(),
+            Some("https://tsa.example.com")
+        );
+        assert_eq!(
+            signer.timestamp_request_headers(),
+            Some(vec![("X-Api-Key".to_owned(), "k-123".to_owned())])
+        );
+    }
+
+    /// The CAWG wrapper forwards the C2PA signer's headers; its own
+    /// `tsa_headers` are ignored, like `tsa_url` (the identity signature is not
+    /// time stamped).
+    #[test]
+    fn tsa_headers_survive_cawg_wrapping() {
+        let settings = local_signer_settings_with_tsa_headers(
+            "https://tsa.example.com",
+            serde_json::json!([{ "name": "X-Api-Key", "value": "k-123" }]),
+        )
+        .unwrap();
+        let signer_settings = settings.signer.expect("signer settings should be present");
+        let c2pa_signer = signer_settings.clone().c2pa_signer().unwrap();
+        let combined = signer_settings.cawg_signer(c2pa_signer).unwrap();
+        assert_eq!(
+            combined.timestamp_request_headers(),
+            Some(vec![("X-Api-Key".to_owned(), "k-123".to_owned())])
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_header_constructors_resolve() {
+        use super::TsaHeader;
+
+        assert_eq!(
+            TsaHeader::with_value("X-Tenant", "acme").resolve().unwrap(),
+            ("X-Tenant".to_owned(), "acme".to_owned())
+        );
+
+        const VAR: &str = "C2PA_TEST_TSA_HEADERS_CTOR";
+        let _guard = EnvVarGuard::set(VAR, "abc123");
+        assert_eq!(
+            TsaHeader::from_env("Authorization", VAR)
+                .with_format("Bearer {value}")
+                .resolve()
+                .unwrap(),
+            ("Authorization".to_owned(), "Bearer abc123".to_owned())
+        );
+    }
+
+    /// The headers must reach the TSA on the wire, next to the SDK's own
+    /// `Content-Type`. The mock answers 500 so the request is observable without
+    /// a real RFC 3161 response; the resulting error is a time stamp error from
+    /// the HTTP round trip, not a configuration error raised before sending.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_headers_are_sent_with_the_time_stamp_request() {
+        use httpmock::MockServer;
+
+        use crate::Error;
+
+        let server = MockServer::start();
+        let tsa = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/tsa")
+                .header("Authorization", "Bearer abc123")
+                .header("X-Tenant", "acme-prod")
+                .header("Content-Type", "application/timestamp-query");
+            then.status(500);
+        });
+
+        let settings = local_signer_settings_with_tsa_headers(
+            &server.url("/tsa"),
+            serde_json::json!([
+                { "name": "Authorization", "value": "Bearer abc123" },
+                { "name": "X-Tenant", "value": "acme-prod" },
+            ]),
+        )
+        .unwrap();
+        let signer = c2pa_signer_from(settings).unwrap();
+
+        let result = signer
+            .send_timestamp_request(b"claim bytes")
+            .expect("signer has a tsa_url, so a request is attempted");
+
+        tsa.assert();
+        assert!(
+            matches!(result, Err(Error::TimeStampError(_))),
+            "{result:?}"
+        );
+    }
+
+    /// The `TimeStamp` assertion refresh path (used by `Builder` for ingredient
+    /// manifests) sends the same headers.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tsa_headers_are_sent_when_refreshing_timestamp_assertions() {
+        use httpmock::MockServer;
+
+        let server = MockServer::start();
+        let tsa = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/tsa")
+                .header("Authorization", "Bearer abc123")
+                .header("Content-Type", "application/timestamp-query");
+            then.status(500);
+        });
+
+        let headers = Some(vec![(
+            "Authorization".to_owned(),
+            "Bearer abc123".to_owned(),
+        )]);
+        let result = crate::assertions::TimeStamp::send_timestamp_token_request(
+            &server.url("/tsa"),
+            headers,
+            b"signature",
+            &crate::Context::new(),
+        );
+
+        tsa.assert();
+        assert!(result.is_err());
     }
 }

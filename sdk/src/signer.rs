@@ -68,8 +68,14 @@ pub trait Signer {
 
     /// Additional request headers to pass to the time stamp authority.
     ///
+    /// Use this to authenticate to a TSA that requires, for example, an
+    /// `Authorization` header. Signers created from [`SignerSettings`] populate
+    /// this from the `tsa_headers` setting.
+    ///
     /// IMPORTANT: You should not include the "Content-type" header here.
     /// That is provided by default.
+    ///
+    /// [`SignerSettings`]: crate::settings::signer::SignerSettings
     fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
         None
     }
@@ -181,8 +187,14 @@ pub trait AsyncSigner: MaybeSend + MaybeSync {
 
     /// Additional request headers to pass to the time stamp authority.
     ///
+    /// Use this to authenticate to a TSA that requires, for example, an
+    /// `Authorization` header. Signers created from [`SignerSettings`] populate
+    /// this from the `tsa_headers` setting.
+    ///
     /// IMPORTANT: You should not include the "Content-type" header here.
     /// That is provided by default.
+    ///
+    /// [`SignerSettings`]: crate::settings::signer::SignerSettings
     fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
         None
     }
@@ -339,13 +351,15 @@ impl<T: ?Sized + AsyncSigner> AsyncSigner for Box<T> {
 }
 
 /// Wraps a [`RawSigner`] (raw signature only) into a full [`Signer`], layering
-/// on the optional time stamp service URL and the overall COSE reserve-size
-/// calculation that the raw signer does not know about.
+/// on the optional time stamp service URL (plus any request headers it needs)
+/// and the overall COSE reserve-size calculation that the raw signer does not
+/// know about.
 #[allow(dead_code)] // Not used in all configurations.
 pub(crate) struct RawSignerWrapper {
     raw_signer: Box<dyn RawSigner + Send + Sync>,
     cert_chain: Vec<Vec<u8>>,
     time_stamp_service_url: Option<String>,
+    time_stamp_request_headers: Option<Vec<(String, String)>>,
 }
 
 impl RawSignerWrapper {
@@ -358,7 +372,18 @@ impl RawSignerWrapper {
             raw_signer,
             cert_chain,
             time_stamp_service_url,
+            time_stamp_request_headers: None,
         }
+    }
+
+    /// Sets the additional HTTP headers sent with each time stamp request (see
+    /// [`Signer::timestamp_request_headers`]).
+    pub(crate) fn with_time_stamp_request_headers(
+        mut self,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Self {
+        self.time_stamp_request_headers = headers;
+        self
     }
 }
 
@@ -386,6 +411,10 @@ impl Signer for RawSignerWrapper {
 
     fn time_authority_url(&self) -> Option<String> {
         self.time_stamp_service_url.clone()
+    }
+
+    fn timestamp_request_headers(&self) -> Option<Vec<(String, String)>> {
+        self.time_stamp_request_headers.clone()
     }
 }
 
